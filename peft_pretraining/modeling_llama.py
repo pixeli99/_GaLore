@@ -19,6 +19,7 @@
 # limitations under the License.
 """ PyTorch LLaMA model."""
 import math
+import os
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -147,13 +148,16 @@ class LlamaMLP(nn.Module):
         hidden_size: int,
         intermediate_size: int,
         hidden_act: str,
+        scale_mlp_output: bool = False,
     ):
         super().__init__()
         self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
         self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.act_fn = ACT2FN[hidden_act]
-
+        
+        if scale_mlp_output:
+            self.down_proj.is_scaled_layer = True
     def forward(self, x):
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
@@ -161,7 +165,7 @@ class LlamaMLP(nn.Module):
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: LlamaConfig):
+    def __init__(self, config: LlamaConfig, scale_attn_weights: bool = False):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
@@ -179,6 +183,9 @@ class LlamaAttention(nn.Module):
         self.v_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
         self.rotary_emb = LlamaRotaryEmbedding(self.head_dim, max_position_embeddings=self.max_position_embeddings)
+        
+        if scale_attn_weights:
+            self.o_proj.is_scaled_layer = True
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
@@ -241,18 +248,126 @@ class LlamaAttention(nn.Module):
 
 
 class LlamaDecoderLayer(nn.Module):
-    def __init__(self, config: LlamaConfig):
+    def __init__(self, config: LlamaConfig, layer_index: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = LlamaAttention(config=config)
+        
+        norm_type = os.getenv('NORM_TYPE', 'pre').lower()
+        self.layer_nums = config.num_hidden_layers
+        self.layer_index = layer_index
+        print('Hi, 🙍‍♂️🙍‍♂️🙍‍♂️🙍‍♂️🙍‍♂️🙍‍♂️🙍‍♂️🙍‍♂️🙍‍♂️🙍‍♂️🙍‍♂️🙍‍♂️🙍‍♂️🙍‍♂️🙍‍♂️🙍‍♂️🙍‍♂️🙍‍♂️🙍‍♂️🙍‍♂️🙍‍♂️the norm type is:', norm_type)
+        
+        scale_attn_weights = False
+        scale_mlp_output = False
+        self.max_post_norm_layer = 8
+
+        if norm_type == 'scale_post_pre':
+            if self.layer_index < self.max_post_norm_layer:
+                scale_attn_weights = False
+                scale_mlp_output = False
+            else:
+                scale_attn_weights = True
+                scale_mlp_output = True
+        if norm_type == 'scale_pre':
+            scale_attn_weights = True
+            scale_mlp_output = True
+
+        self.self_attn = LlamaAttention(config=config, scale_attn_weights=scale_attn_weights)
         self.mlp = LlamaMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
+            scale_mlp_output=scale_mlp_output,
         )
-        self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
+        
+        if norm_type == 'pre' or norm_type == 'scale_pre':
+            self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        elif norm_type== 'post':
+            self.post_feedforward_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        elif norm_type == 'sandwich':
+            self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.pre_feedforward_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.post_feedforward_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        elif norm_type == 'pre_post':
+            print("cur layer index is:", layer_index)
+            self.max_pre_norm_layer = 7
+            if self.layer_index < self.max_pre_norm_layer:
+                self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+                self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            else:
+                self.post_feedforward_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+                self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        elif norm_type == 'pre_sandwich':
+            print("cur layer index is:", layer_index)
+            self.max_pre_norm_layer = 7
+            if self.layer_index < self.max_pre_norm_layer:
+                self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+                self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            else:
+                self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+                self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+                self.pre_feedforward_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+                self.post_feedforward_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        elif norm_type == 'post_pre' or norm_type == 'scale_post_pre':
+            print("cur layer index is:", layer_index)
+            if self.layer_index < self.max_post_norm_layer:
+                print(f"cur layer is {layer_index}, and you're using the post norm!")
+                self.post_feedforward_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+                self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            else:
+                self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+                self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        elif norm_type == 'scale_res_pre_norm':
+            self.raw_scaling_factor_attn = nn.Parameter(torch.tensor(0.001))
+            self.raw_scaling_factor_mlp = nn.Parameter(torch.tensor(0.001))
+            self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        elif norm_type == 'pre_post_pre_post':
+            print("cur layer index is:", layer_index)
+            # For even-numbered layers, use pre-norm
+            if (self.layer_index + 1) % 4 != 0:
+                self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+                self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            else:
+                self.post_feedforward_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+                self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        elif norm_type == 'post_pre_post_pre':
+            print("cur layer index is:", layer_index)
+            # For even-numbered layers, use pre-norm
+            if (self.layer_index + 1) % 4 != 0:
+                self.post_feedforward_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+                self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            else:
+                self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+                self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        elif norm_type == 'mono':
+            if (self.layer_index + 1) % 4 != 0:
+                # Pre-LayerNorm Only
+                self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+                self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            else:
+                # Post-LayerNorm & Pre-LayerNorm
+                self.router = nn.Linear(config.hidden_size, 2, bias=False)
+                self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+                self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+                self.post_feedforward_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+                self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        elif norm_type == 'mono_reverse':
+            if (self.layer_index + 1) % 4 != 0:
+                # Post-LayerNorm Only
+                self.post_feedforward_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+                self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            else:
+                # Post-LayerNorm & Pre-LayerNorm
+                self.router = nn.Linear(config.hidden_size, 2, bias=False)
+                self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+                self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+                self.post_feedforward_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+                self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -276,26 +391,365 @@ class LlamaDecoderLayer(nn.Module):
             past_key_value (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
         """
 
-        residual = hidden_states
+        norm_type = os.getenv('NORM_TYPE', 'pre').lower()
+        
+        if norm_type == 'pre' or norm_type == 'scale_pre':
+            # Pre-LayerNorm Only
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+            hidden_states, self_attn_weights, present_key_value = self.self_attn(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+            )
+            hidden_states = residual + hidden_states
 
-        hidden_states = self.input_layernorm(hidden_states)
+            residual = hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = self.mlp(hidden_states)
+            hidden_states = residual + hidden_states
+        elif norm_type == 'scale_res_pre_norm':
+            # Pre-LayerNorm Only
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+            hidden_states, self_attn_weights, present_key_value = self.self_attn(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+            )
+            hidden_states = residual + hidden_states * self.raw_scaling_factor_attn
 
-        # Self Attention
-        hidden_states, self_attn_weights, present_key_value = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
-            output_attentions=output_attentions,
-            use_cache=use_cache,
-        )
-        hidden_states = residual + hidden_states
+            residual = hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = self.mlp(hidden_states)
+            hidden_states = residual + hidden_states * self.raw_scaling_factor_mlp
+        elif norm_type == 'post':
+            # Post-LayerNorm Only
+            residual = hidden_states
+            hidden_states, self_attn_weights, present_key_value = self.self_attn(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+            )
+            hidden_states = residual + hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
 
-        # Fully Connected
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+            residual = hidden_states
+            hidden_states = self.mlp(hidden_states)
+            hidden_states = residual + hidden_states
+            hidden_states = self.post_feedforward_layernorm(hidden_states)
+
+        elif norm_type == 'sandwich':
+            # Pre + Post LayerNorm (default)
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+            hidden_states, self_attn_weights, present_key_value = self.self_attn(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+            )
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = residual + hidden_states
+
+            residual = hidden_states
+            hidden_states = self.pre_feedforward_layernorm(hidden_states)
+            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.post_feedforward_layernorm(hidden_states)
+            hidden_states = residual + hidden_states
+        
+        elif norm_type == 'pre_post':
+            if self.layer_index < self.max_pre_norm_layer:
+                # Pre-LayerNorm Only
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+                hidden_states, self_attn_weights, present_key_value = self.self_attn(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_value,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                )
+                hidden_states = residual + hidden_states
+
+                residual = hidden_states
+                hidden_states = self.post_attention_layernorm(hidden_states)
+                hidden_states = self.mlp(hidden_states)
+                hidden_states = residual + hidden_states
+            else:
+                # Post-LayerNorm Only
+                residual = hidden_states
+                hidden_states, self_attn_weights, present_key_value = self.self_attn(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_value,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                )
+                hidden_states = residual + hidden_states
+                hidden_states = self.post_attention_layernorm(hidden_states)
+
+                residual = hidden_states
+                hidden_states = self.mlp(hidden_states)
+                hidden_states = residual + hidden_states
+                hidden_states = self.post_feedforward_layernorm(hidden_states)
+        
+        elif norm_type == 'pre_sandwich':
+            if self.layer_index < self.max_pre_norm_layer:
+                # Pre-LayerNorm Only
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+                hidden_states, self_attn_weights, present_key_value = self.self_attn(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_value,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                )
+                hidden_states = residual + hidden_states
+
+                residual = hidden_states
+                hidden_states = self.post_attention_layernorm(hidden_states)
+                hidden_states = self.mlp(hidden_states)
+                hidden_states = residual + hidden_states
+            else:
+               # Pre + Post LayerNorm (default)
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+                hidden_states, self_attn_weights, present_key_value = self.self_attn(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_value,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                )
+                hidden_states = self.post_attention_layernorm(hidden_states)
+                hidden_states = residual + hidden_states
+
+                residual = hidden_states
+                hidden_states = self.pre_feedforward_layernorm(hidden_states)
+                hidden_states = self.mlp(hidden_states)
+                hidden_states = self.post_feedforward_layernorm(hidden_states)
+                hidden_states = residual + hidden_states
+
+        elif norm_type == 'post_pre' or norm_type == 'scale_post_pre':
+            if self.layer_index < self.max_post_norm_layer:
+                # Post-LayerNorm Only
+                residual = hidden_states
+                hidden_states, self_attn_weights, present_key_value = self.self_attn(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_value,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                )
+                hidden_states = residual + hidden_states
+                hidden_states = self.post_attention_layernorm(hidden_states)
+
+                residual = hidden_states
+                hidden_states = self.mlp(hidden_states)
+                hidden_states = residual + hidden_states
+                hidden_states = self.post_feedforward_layernorm(hidden_states)
+            else:
+                # Pre-LayerNorm Only
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+                hidden_states, self_attn_weights, present_key_value = self.self_attn(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_value,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                )
+                hidden_states = residual + hidden_states
+
+                residual = hidden_states
+                hidden_states = self.post_attention_layernorm(hidden_states)
+                hidden_states = self.mlp(hidden_states)
+                hidden_states = residual + hidden_states
+        elif norm_type == 'mono':
+            if (self.layer_index + 1) % 4 != 0:
+                # Pre-LayerNorm Only
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+                hidden_states, self_attn_weights, present_key_value = self.self_attn(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_value,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                )
+                hidden_states = residual + hidden_states
+
+                residual = hidden_states
+                hidden_states = self.post_attention_layernorm(hidden_states)
+                hidden_states = self.mlp(hidden_states)
+                hidden_states = residual + hidden_states
+            else:
+                # b, n, c -> b, 2
+                router_logits = self.router(hidden_states).mean(dim=1)
+                router_output = torch.nn.functional.gumbel_softmax(router_logits, tau=1, hard=True)
+                
+                ### pre branch
+                hidden_states_pre = hidden_states.clone()
+                residual = hidden_states_pre
+                hidden_states_pre = self.input_layernorm(hidden_states_pre)
+                hidden_states_pre, self_attn_weights, present_key_value = self.self_attn(
+                    hidden_states=hidden_states_pre,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_value,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                )
+                hidden_states_pre = residual + hidden_states_pre
+
+                residual = hidden_states_pre
+                hidden_states_pre = self.post_attention_layernorm(hidden_states_pre)
+                hidden_states_pre = self.mlp(hidden_states_pre)
+                hidden_states_pre = residual + hidden_states_pre
+                ###
+                ### post norm
+                hidden_states_post = hidden_states.clone()
+                residual = hidden_states_post
+                hidden_states_post, self_attn_weights, present_key_value = self.self_attn(
+                    hidden_states=hidden_states_post,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_value,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                )
+                hidden_states_post = residual + hidden_states_post
+                hidden_states_post = self.post_attention_layernorm(hidden_states_post)
+
+                residual = hidden_states_post
+                hidden_states_post = self.mlp(hidden_states_post)
+                hidden_states_post = residual + hidden_states_post
+                hidden_states_post = self.post_feedforward_layernorm(hidden_states_post)
+            
+                hidden_states = router_output[:, 0:1] * hidden_states_pre + router_output[:, 1:] * hidden_states_post
+
+        elif norm_type == 'mono_reverse':
+            if (self.layer_index + 1) % 4 != 0:
+                # Post-LayerNorm Only
+                residual = hidden_states
+                hidden_states, self_attn_weights, present_key_value = self.self_attn(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_value,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                )
+                hidden_states = residual + hidden_states
+                hidden_states = self.post_attention_layernorm(hidden_states)
+
+                residual = hidden_states
+                hidden_states = self.post_attention_layernorm(hidden_states)
+                hidden_states = self.mlp(hidden_states)
+                hidden_states = residual + hidden_states
+                hidden_states = self.post_feedforward_layernorm(hidden_states)
+            else:
+                # b, n, c -> b, 2
+                router_logits = self.router(hidden_states).mean(dim=1)
+                router_output = torch.nn.functional.gumbel_softmax(router_logits, tau=1, hard=True)
+                
+                ### pre branch
+                hidden_states_pre = hidden_states.clone()
+                residual = hidden_states_pre
+                hidden_states_pre = self.input_layernorm(hidden_states_pre)
+                hidden_states_pre, self_attn_weights, present_key_value = self.self_attn(
+                    hidden_states=hidden_states_pre,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_value,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                )
+                hidden_states_pre = residual + hidden_states_pre
+
+                residual = hidden_states_pre
+                hidden_states_pre = self.post_attention_layernorm(hidden_states_pre)
+                hidden_states_pre = self.mlp(hidden_states_pre)
+                hidden_states_pre = residual + hidden_states_pre
+                ###
+                ### post norm
+                hidden_states_post = hidden_states.clone()
+                residual = hidden_states_post
+                hidden_states_post, self_attn_weights, present_key_value = self.self_attn(
+                    hidden_states=hidden_states_post,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_value,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                )
+                hidden_states_post = residual + hidden_states_post
+                hidden_states_post = self.post_attention_layernorm(hidden_states_post)
+
+                residual = hidden_states_post
+                hidden_states_post = self.mlp(hidden_states_post)
+                hidden_states_post = residual + hidden_states_post
+                hidden_states_post = self.post_feedforward_layernorm(hidden_states_post)
+            
+                hidden_states = router_output[:, 0:1] * hidden_states_pre + router_output[:, 1:] * hidden_states_post
+                
+        elif norm_type == 'post_pre_post_pre':
+            if (self.layer_index + 1) % 4 == 0:
+                # Pre-LayerNorm Only
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+                hidden_states, self_attn_weights, present_key_value = self.self_attn(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_value,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                )
+                hidden_states = residual + hidden_states
+
+                residual = hidden_states
+                hidden_states = self.post_attention_layernorm(hidden_states)
+                hidden_states = self.mlp(hidden_states)
+                hidden_states = residual + hidden_states
+            else:
+                # Post-LayerNorm Only
+                residual = hidden_states
+                hidden_states, self_attn_weights, present_key_value = self.self_attn(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_value,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                )
+                hidden_states = residual + hidden_states
+                hidden_states = self.post_attention_layernorm(hidden_states)
+
+                residual = hidden_states
+                hidden_states = self.mlp(hidden_states)
+                hidden_states = residual + hidden_states
+                hidden_states = self.post_feedforward_layernorm(hidden_states)
 
         outputs = (hidden_states,)
 
@@ -336,14 +790,33 @@ class LlamaPreTrainedModel(PreTrainedModel):
     _no_split_modules = ["LlamaDecoderLayer"]
     _keys_to_ignore_on_load_unexpected = [r"decoder\.version"]
 
+    # def _init_weights(self, module):
+    #     std = self.config.initializer_range
+    #     if isinstance(module, nn.Linear):
+    #         module.weight.data.normal_(mean=0.0, std=std)
+    #         if module.bias is not None:
+    #             module.bias.data.zero_()
+    #     elif isinstance(module, nn.Embedding):
+    #         module.weight.data.normal_(mean=0.0, std=std)
+    #         if module.padding_idx is not None:
+    #             module.weight.data[module.padding_idx].zero_()
     def _init_weights(self, module):
         std = self.config.initializer_range
+        num_layers = self.config.num_hidden_layers
+        scaled_std = std / (2 * num_layers) ** 0.5
         if isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=std)
+            # 对于 W2 和 WO 层执行缩放初始化
+            if hasattr(module, "is_scaled_layer") and module.is_scaled_layer:
+                module.weight.data.normal_(mean=0.0, std=scaled_std)
+                print('-'*50)
+                print('Warning: scaled init for layer:', module)
+                print('-'*50)
+            else:
+                module.weight.data.normal_(mean=0.0, std=std)
             if module.bias is not None:
                 module.bias.data.zero_()
         elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=std)
+            module.weight.data.normal_(mean=0.0, std=(2 / 5) ** 0.5)
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
 
@@ -434,7 +907,7 @@ class LlamaModel(LlamaPreTrainedModel):
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.layers = nn.ModuleList([LlamaDecoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.layers = nn.ModuleList([LlamaDecoderLayer(config, _idx) for _idx in range(config.num_hidden_layers)])
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.gradient_checkpointing = False

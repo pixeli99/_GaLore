@@ -28,6 +28,7 @@ from peft_pretraining.modeling_llama import LlamaForCausalLM
 import bitsandbytes as bnb
 from galore_torch import GaLoreAdamW, GaLoreAdamW8bit, GaLoreAdafactor
 
+import matplotlib.pyplot as plt
 transformers.logging.set_verbosity_error()
 
 def parse_args(args):
@@ -47,7 +48,7 @@ def parse_args(args):
     parser.add_argument("--activation_checkpointing", action="store_true")
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--warmup_steps", type=int, default=1_000)
-    parser.add_argument("--eval_every", type=int, default=5_000)
+    parser.add_argument("--eval_every", type=int, default=2_000)
     parser.add_argument("--num_training_steps", type=int, default=10_000,
                         help="Number of **update steps** to train for. "
                              "Notice that gradient accumulation is taken into account.")
@@ -61,7 +62,8 @@ def parse_args(args):
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--name", type=str, default="test")
-    parser.add_argument("--grad_clipping", type=float, default=0.0)   
+    parser.add_argument("--grad_clipping", type=float, default=1.0)   
+    parser.add_argument("--run_name", type=str, default="default")
     # beta1 for adafactor
     parser.add_argument("--beta1", type=float, default=0.0)
     
@@ -83,7 +85,7 @@ def parse_args(args):
 @torch.no_grad()
 def evaluate_model(model, preprocess_batched, pad_idx, global_rank, world_size, device, batch_size):
     _time = time.time()
-    val_data = datasets.load_dataset("c4", "en", split="validation", streaming=True) #DGX
+    val_data = datasets.load_dataset("c4", "en", split="validation", streaming=True, trust_remote_code=True) #DGX
     val_data = val_data.shuffle(seed=42)
     logger.info(f"Loaded validation dataset in {time.time() - _time:.2f} seconds")
 
@@ -158,7 +160,7 @@ def main(args):
             
     # initialize wandb without config (it is passed later)
     if global_rank == 0:
-        wandb.init(project="galore-c4")
+        wandb.init(project="galore-c4-7b", name=args.run_name)
         
     logger.info(f"Using dist with rank {global_rank} (only rank 0 will log)")
     logger.info("*" * 40)
@@ -169,7 +171,7 @@ def main(args):
 
     data = datasets.load_dataset("allenai/c4", "en", split="train", streaming=True)
 
-    seed_for_shuffle = 42 
+    seed_for_shuffle = 32 
     
     logger.info(f"Shuffling data with seed {seed_for_shuffle}")
     data: datasets.Dataset = data.shuffle(seed=seed_for_shuffle)
@@ -213,8 +215,13 @@ def main(args):
     if args.continue_from is not None:
         logger.info("*" * 40)
         logger.info(f"Loading model from {args.continue_from}")
-        checkpoint_path = os.path.join(args.continue_from, "pytorch_model.bin")
-        model.load_state_dict(torch.load(checkpoint_path, map_location="cpu"), strict=True)
+        
+        from safetensors.torch import load_file
+        state_dict = load_file(f"{args.continue_from}/model.safetensors")
+        model.load_state_dict(state_dict)
+        
+        # checkpoint_path = os.path.join(args.continue_from, "pytorch_model.bin")
+        # model.load_state_dict(torch.load(checkpoint_path, map_location="cpu"), strict=True)
         logger.info(f"Model successfully loaded (strict=True policy)")
 
         if os.path.exists(os.path.join(args.continue_from, "training_state.json")):
@@ -290,84 +297,7 @@ def main(args):
     
     layer_wise_flag = False
     if args.optimizer.lower() == "adam":
-        optimizer = torch.optim.Adam(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
-    elif args.optimizer.lower() == "galore_adamw":
-        # redefine way to call galore_adamw
-        optimizer = GaLoreAdamW(param_groups, lr=args.lr, weight_decay=args.weight_decay)
-    # implement sgd
-    elif args.optimizer.lower() == "sgd":
-        optimizer = torch.optim.SGD(trainable_params, lr=args.lr, weight_decay=args.weight_decay, momentum=args.beta1)
-    # implement adafactor
-    elif args.optimizer.lower() == "adafactor":
-        args.beta1 = None if args.beta1 == 0.0 else args.beta1
-        optimizer = transformers.optimization.Adafactor(
-            trainable_params,
-            lr=args.lr,
-            eps=(1e-30, 1e-3),
-            clip_threshold=1.0,
-            decay_rate=-0.8,
-            beta1=args.beta1,
-            weight_decay=args.weight_decay,
-            relative_step=False,
-            scale_parameter=False,
-            warmup_init=False,
-        )
-    # low-rank adafactor
-    elif args.optimizer.lower() == "galore_adafactor":
-        args.beta1 = None if args.beta1 == 0.0 else args.beta1
-        optimizer = GaLoreAdafactor(
-            param_groups,
-            lr=args.lr,
-            eps=(1e-30, 1e-3),
-            clip_threshold=1.0,
-            decay_rate=-0.8,
-            beta1=args.beta1,
-            weight_decay=args.weight_decay,
-            relative_step=False,
-            scale_parameter=False,
-            warmup_init=False,
-        )
-    # 8-bit Adam
-    elif args.optimizer.lower() == "adam8bit":
-        optimizer = bnb.optim.Adam8bit(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
-    elif args.optimizer.lower() == "galore_adamw8bit":
-        optimizer = GaLoreAdamW8bit(param_groups, lr=args.lr, weight_decay=args.weight_decay)
-    elif args.optimizer.lower() == 'galore_adamw8bit_per_layer':
-        # TODO: seems scheduler call twice in one update step, need to check, for now double the num_training_steps, warmup_steps and update_proj_gap
-        optimizer_dict = {}
-        for p in model.parameters():
-            if p.requires_grad:
-                if id(p) in id_galore_params:
-                    optimizer_dict[p] = GaLoreAdamW8bit([{'params': [p], 'rank': args.rank, 'update_proj_gap': args.update_proj_gap * 2, 'scale': args.galore_scale, 'proj_type': args.proj_type}], lr=args.lr, weight_decay=args.weight_decay)
-                else:
-                    optimizer_dict[p] = bnb.optim.Adam8bit([p], lr=args.lr, weight_decay=args.weight_decay)
-
-        # get scheduler dict
-        scheduler_dict = {}
-        for p in model.parameters():
-            if p.requires_grad:
-                scheduler_dict[p] = training_utils.get_scheculer(
-                    optimizer=optimizer_dict[p],
-                    scheduler_type=args.scheduler,
-                    num_training_steps=args.num_training_steps * 2,
-                    warmup_steps=args.warmup_steps * 2,
-                    min_lr_ratio=args.min_lr_ratio,
-                )
-
-        def optimizer_hook(p):
-            if p.grad is None: 
-                return
-            optimizer_dict[p].step()
-            optimizer_dict[p].zero_grad()
-            scheduler_dict[p].step()
-
-        # Register the hook onto every parameter
-        for p in model.parameters():
-            if p.requires_grad:
-                p.register_post_accumulate_grad_hook(optimizer_hook)
-                
-        layer_wise_flag = True
-        
+        optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay, eps=10e-5, betas=(0.9, 0.95))
     else:
         raise ValueError(f"Optimizer {args.optimizer} not supported")
 
@@ -420,11 +350,30 @@ def main(args):
         if global_step % args.gradient_accumulation != 0:
             continue
 
-
         # The below code is only executed during the update step
         
         # add grad clipping
         if args.grad_clipping != 0.0: torch.nn.utils.clip_grad_norm_(trainable_params, args.grad_clipping)
+        
+        # if global_step % 10 == 0:
+        #     # 存储每个层的最大梯度范数
+        #     layer_sum_grad_norms = {}
+
+        #     # 遍历模型的所有层和参数
+        #     for i, layer in enumerate(model.module.model.layers):
+        #         sum_norm = 0
+        #         for name, param in layer.named_parameters():
+        #             if param.grad is not None:
+        #                 param_norm = param.grad.norm().item()
+        #                 sum_norm += param_norm
+        #         layer_sum_grad_norms[f"layer_{i}"] = sum_norm  # 记录每一层的最大梯度范数
+
+        #     # 记录最大梯度范数和相应的层
+        #     if global_rank == 0:
+        #         for layer_name, sum_norm in layer_sum_grad_norms.items():
+        #             wandb.log({
+        #                 f"layer_max_grad_norm/{layer_name}": sum_norm,  # 每个层的最大梯度范数
+        #             }, step=global_step)
 
         if global_rank == 0: pbar.update(1)
         
@@ -489,7 +438,7 @@ def main(args):
         if not layer_wise_flag:
             lr = optimizer.param_groups[0]["lr"]
         else:
-            lr = list(optimizer_dict.values())[0].param_groups[0]["lr"]
+            pass
         tokens_in_update = tokens_seen - tokens_seen_before
         tokens_seen_before = tokens_seen
         batches_in_update = args.gradient_accumulation * world_size
