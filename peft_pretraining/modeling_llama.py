@@ -158,6 +158,10 @@ class LlamaMLP(nn.Module):
         
         if scale_mlp_output:
             self.down_proj.is_scaled_layer = True
+        if os.getenv('NORM_TYPE').lower() == 'deeppost':
+            self.gate_proj.is_deeppost_layer = True
+            self.up_proj.is_deeppost_layer = True
+            self.down_proj.is_deeppost_layer = True
     def forward(self, x):
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
@@ -186,6 +190,12 @@ class LlamaAttention(nn.Module):
         
         if scale_attn_weights:
             self.o_proj.is_scaled_layer = True
+        if os.getenv('NORM_TYPE').lower() == 'deeppost':
+            self.v_proj.is_deeppost_layer = True
+            self.o_proj.is_deeppost_layer = True
+            # ---- - - - - -
+            self.q_proj.is_deeppost_layer_qk = True
+            self.k_proj.is_deeppost_layer_qk = True
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
@@ -283,7 +293,7 @@ class LlamaDecoderLayer(nn.Module):
         if norm_type == 'pre' or norm_type == 'scale_pre':
             self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        elif norm_type== 'post':
+        elif norm_type== 'post' or norm_type == 'deeppost':
             self.post_feedforward_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         elif norm_type == 'sandwich':
@@ -429,7 +439,7 @@ class LlamaDecoderLayer(nn.Module):
             hidden_states = self.post_attention_layernorm(hidden_states)
             hidden_states = self.mlp(hidden_states)
             hidden_states = residual + hidden_states * self.raw_scaling_factor_mlp
-        elif norm_type == 'post':
+        elif norm_type == 'post' or norm_type == 'deeppost':
             # Post-LayerNorm Only
             residual = hidden_states
             hidden_states, self_attn_weights, present_key_value = self.self_attn(
@@ -440,11 +450,15 @@ class LlamaDecoderLayer(nn.Module):
                 output_attentions=output_attentions,
                 use_cache=use_cache,
             )
+            if norm_type == 'deeppost':
+                residual = 2.632 * residual
             hidden_states = residual + hidden_states
             hidden_states = self.post_attention_layernorm(hidden_states)
 
             residual = hidden_states
             hidden_states = self.mlp(hidden_states)
+            if norm_type == 'deeppost':
+                residual = 2.632 * residual
             hidden_states = residual + hidden_states
             hidden_states = self.post_feedforward_layernorm(hidden_states)
 
@@ -805,8 +819,13 @@ class LlamaPreTrainedModel(PreTrainedModel):
         num_layers = self.config.num_hidden_layers
         scaled_std = std / (2 * num_layers) ** 0.5
         if isinstance(module, nn.Linear):
+            # 对 deepnorm 的层执行缩放初始化
+            if hasattr(module, "is_deeppost_layer") and module.is_deeppost_layer:
+                torch.nn.init.xavier_normal_(module.weight, gain=(num_layers * 8) ** 0.25)
+            elif hasattr(module, "is_deeppost_layer_qk") and module.is_deeppost_layer_qk:
+                torch.nn.init.xavier_normal_(module.weight, gain=1)
             # 对于 W2 和 WO 层执行缩放初始化
-            if hasattr(module, "is_scaled_layer") and module.is_scaled_layer:
+            elif hasattr(module, "is_scaled_layer") and module.is_scaled_layer:
                 module.weight.data.normal_(mean=0.0, std=scaled_std)
                 print('-'*50)
                 print('Warning: scaled init for layer:', module)
