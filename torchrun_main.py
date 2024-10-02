@@ -26,7 +26,6 @@ from peft_pretraining.dataloader import PreprocessedIterableDataset
 from peft_pretraining.modeling_llama import LlamaForCausalLM
 
 import bitsandbytes as bnb
-from galore_torch import GaLoreAdamW, GaLoreAdamW8bit, GaLoreAdafactor
 
 import matplotlib.pyplot as plt
 transformers.logging.set_verbosity_error()
@@ -297,7 +296,7 @@ def main(args):
     
     layer_wise_flag = False
     if args.optimizer.lower() == "adam":
-        optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay, eps=10e-5, betas=(0.9, 0.95))
+        optimizer = torch.optim.Adam(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
     else:
         raise ValueError(f"Optimizer {args.optimizer} not supported")
 
