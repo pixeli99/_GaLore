@@ -265,8 +265,7 @@ class LlamaDecoderLayer(nn.Module):
         norm_type = os.getenv('NORM_TYPE', 'pre').lower()
         self.layer_nums = config.num_hidden_layers
         self.layer_index = layer_index
-        print('Hi, 🙍‍♂️🙍‍♂️🙍‍♂️🙍‍♂️🙍‍♂️🙍‍♂️🙍‍♂️🙍‍♂️🙍‍♂️🙍‍♂️🙍‍♂️🙍‍♂️🙍‍♂️🙍‍♂️🙍‍♂️🙍‍♂️🙍‍♂️🙍‍♂️🙍‍♂️🙍‍♂️🙍‍♂️the norm type is:', norm_type)
-        
+        print('Hi, 🙍‍♂️️the norm type is:', norm_type)
         scale_attn_weights = False
         scale_mlp_output = False
         self.max_post_norm_layer = 8
@@ -819,12 +818,10 @@ class LlamaPreTrainedModel(PreTrainedModel):
         num_layers = self.config.num_hidden_layers
         scaled_std = std / (2 * num_layers) ** 0.5
         if isinstance(module, nn.Linear):
-            # 对 deepnorm 的层执行缩放初始化
             if hasattr(module, "is_deeppost_layer") and module.is_deeppost_layer:
                 torch.nn.init.xavier_normal_(module.weight, gain=(num_layers * 8) ** 0.25)
             elif hasattr(module, "is_deeppost_layer_qk") and module.is_deeppost_layer_qk:
                 torch.nn.init.xavier_normal_(module.weight, gain=1)
-            # 对于 W2 和 WO 层执行缩放初始化
             elif hasattr(module, "is_scaled_layer") and module.is_scaled_layer:
                 module.weight.data.normal_(mean=0.0, std=scaled_std)
                 print('-'*50)
