@@ -10,17 +10,17 @@ export NORM_TYPE=$norm_type
 
 echo "Training with learning rate: $learning_rates, norm type: $norm_type on GPU $gpu"
 
-CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node 1 --master_port=29500 torchrun_main.py \
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node 4 --master_port=29500 torchrun_main.py \
     --model_config configs/llama_1b.json \
     --lr $learning_rates \
-    --batch_size 8 \
+    --batch_size 64 \
     --total_batch_size 512 \
-    --num_training_steps 150000 \
-    --warmup_steps 15000 \
+    --num_training_steps 100000 \
+    --warmup_steps 1000 \
     --weight_decay 0 \
     --dtype bfloat16 \
     --eval_every 1000 \
     --optimizer adam \
-    --grad_clipping 1.0 \
+    --grad_clipping 0.0 \
     --run_name "1b_res_${norm_type}_lr${learning_rates}" \
-    --save_dir "1b_res_${norm_type}_lr${learning_rates}"
+    --save_dir "./1b_res_${norm_type}_lr${learning_rates}"

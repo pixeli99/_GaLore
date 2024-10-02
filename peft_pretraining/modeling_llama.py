@@ -190,7 +190,7 @@ class LlamaAttention(nn.Module):
         
         if scale_attn_weights:
             self.o_proj.is_scaled_layer = True
-        if os.getenv('NORM_TYPE').lower() == 'deeppost':
+        if os.getenv('NORM_TYPE', 'pre').lower() == 'deeppost':
             self.v_proj.is_deeppost_layer = True
             self.o_proj.is_deeppost_layer = True
             # ---- - - - - -
@@ -451,14 +451,14 @@ class LlamaDecoderLayer(nn.Module):
                 use_cache=use_cache,
             )
             if norm_type == 'deeppost':
-                residual = 2.632 * residual
+                residual = 2.8284271247461903 * residual
             hidden_states = residual + hidden_states
             hidden_states = self.post_attention_layernorm(hidden_states)
 
             residual = hidden_states
             hidden_states = self.mlp(hidden_states)
             if norm_type == 'deeppost':
-                residual = 2.632 * residual
+                residual = 2.8284271247461903 * residual
             hidden_states = residual + hidden_states
             hidden_states = self.post_feedforward_layernorm(hidden_states)
 

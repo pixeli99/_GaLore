@@ -354,26 +354,6 @@ def main(args):
         
         # add grad clipping
         if args.grad_clipping != 0.0: torch.nn.utils.clip_grad_norm_(trainable_params, args.grad_clipping)
-        
-        # if global_step % 10 == 0:
-        #     # 存储每个层的最大梯度范数
-        #     layer_sum_grad_norms = {}
-
-        #     # 遍历模型的所有层和参数
-        #     for i, layer in enumerate(model.module.model.layers):
-        #         sum_norm = 0
-        #         for name, param in layer.named_parameters():
-        #             if param.grad is not None:
-        #                 param_norm = param.grad.norm().item()
-        #                 sum_norm += param_norm
-        #         layer_sum_grad_norms[f"layer_{i}"] = sum_norm  # 记录每一层的最大梯度范数
-
-        #     # 记录最大梯度范数和相应的层
-        #     if global_rank == 0:
-        #         for layer_name, sum_norm in layer_sum_grad_norms.items():
-        #             wandb.log({
-        #                 f"layer_max_grad_norm/{layer_name}": sum_norm,  # 每个层的最大梯度范数
-        #             }, step=global_step)
 
         if global_rank == 0: pbar.update(1)
         
